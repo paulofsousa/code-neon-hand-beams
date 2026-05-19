@@ -107,6 +107,13 @@ html, body {
   z-index: 10;
 }
 
+/* The HTML `hidden` attribute applies display:none via the user-agent
+   stylesheet, which loses to the ID selectors above. Force it to win so
+   the error/start screens can actually be hidden. */
+[hidden] {
+  display: none !important;
+}
+
 #start-screen h1 {
   font-size: 32px;
   letter-spacing: 4px;
