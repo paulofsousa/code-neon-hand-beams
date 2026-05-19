@@ -1,7 +1,36 @@
+// ---------- Logging ----------
+// Console-only. Kept as named helpers so call sites can use level-tagged
+// messages and switch back to an on-screen overlay quickly if needed.
+function dbg(level, ...args) {
+  const ts = (performance.now() / 1000).toFixed(3);
+  const prefix = `[${ts}] [${level}]`;
+  if (level === "ERR") console.error(prefix, ...args);
+  else if (level === "WARN") console.warn(prefix, ...args);
+  else console.log(prefix, ...args);
+}
+
+const log  = (...a) => dbg("LOG ", ...a);
+const warn = (...a) => dbg("WARN", ...a);
+const err  = (...a) => dbg("ERR ", ...a);
+
+window.addEventListener("unhandledrejection", (e) => {
+  err("unhandledrejection:", e.reason);
+});
+window.addEventListener("error", (e) => {
+  err("globalerror:", e.message, "at", e.filename, e.lineno);
+});
+
+log("--- app module loading ---");
+log("UA:", navigator.userAgent);
+log("HTTPS:", location.protocol === "https:");
+log("href:", location.href);
+
 import {
   HandLandmarker,
   FilesetResolver,
 } from "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.35/vision_bundle.mjs";
+
+log("MediaPipe import OK");
 
 // ---------- Configuration ----------
 const MODEL_URL =
@@ -51,41 +80,55 @@ let handLandmarker = null;
 let running = false;
 let lastVideoTime = -1;
 let fpsSamples = [];
+// Last detection result, reused on rAF ticks that don't have a fresh video frame.
+// Without this, the canvas clears every frame but only redraws hands on ticks
+// where the video actually advanced, causing 30Hz flicker against the 60Hz rAF.
+let lastResult = null;
 
 // ---------- Bootstrapping ----------
 async function loadModel() {
+  log("loadModel: resolving WASM fileset from", WASM_URL);
   const fileset = await FilesetResolver.forVisionTasks(WASM_URL);
-  // GPU delegate is faster but fragile on iOS Safari. Fall back to CPU on
-  // any failure so the app still works rather than dying silently.
+  log("loadModel: fileset resolved, creating HandLandmarker (GPU)");
   try {
     handLandmarker = await HandLandmarker.createFromOptions(fileset, {
       baseOptions: { modelAssetPath: MODEL_URL, delegate: "GPU" },
       runningMode: "VIDEO",
       numHands: 2,
-      minHandDetectionConfidence: 0.5,
+      minHandDetectionConfidence: 0.6,
       minHandPresenceConfidence: 0.5,
-      minTrackingConfidence: 0.5,
+      minTrackingConfidence: 0.3,
     });
+    log("loadModel: HandLandmarker ready (GPU)");
   } catch (gpuErr) {
-    console.warn("GPU delegate failed, falling back to CPU:", gpuErr);
+    warn("loadModel: GPU delegate failed, falling back to CPU:", gpuErr);
     handLandmarker = await HandLandmarker.createFromOptions(fileset, {
       baseOptions: { modelAssetPath: MODEL_URL, delegate: "CPU" },
       runningMode: "VIDEO",
       numHands: 2,
-      minHandDetectionConfidence: 0.5,
+      minHandDetectionConfidence: 0.6,
       minHandPresenceConfidence: 0.5,
-      minTrackingConfidence: 0.5,
+      minTrackingConfidence: 0.3,
     });
+    log("loadModel: HandLandmarker ready (CPU fallback)");
   }
 }
 
 async function attachCameraStream(stream) {
+  const tracks = stream.getVideoTracks();
+  log("attachCameraStream: tracks:", tracks.length, tracks.map((t) => `${t.label} [${t.readyState}]`).join(", "));
+  if (tracks.length) {
+    const s = tracks[0].getSettings();
+    log("attachCameraStream: track settings:", `${s.width}x${s.height} facing=${s.facingMode}`);
+  }
   video.srcObject = stream;
   await new Promise((res) => {
-    if (video.readyState >= 2) return res();
-    video.onloadedmetadata = () => res();
+    if (video.readyState >= 2) { log("attachCameraStream: metadata already ready"); return res(); }
+    video.onloadedmetadata = () => { log("attachCameraStream: onloadedmetadata fired"); res(); };
   });
+  log("attachCameraStream: calling video.play()");
   await video.play();
+  log("attachCameraStream: play() resolved, video size:", video.videoWidth, "x", video.videoHeight);
   resizeCanvas();
 }
 
@@ -192,14 +235,13 @@ function renderLoop() {
     ctx.clearRect(0, 0, w, h);
 
     const now = performance.now();
-    let result = null;
     if (video.currentTime !== lastVideoTime) {
       lastVideoTime = video.currentTime;
-      result = handLandmarker.detectForVideo(video, now);
+      lastResult = handLandmarker.detectForVideo(video, now);
     }
 
-    if (result && result.landmarks && result.landmarks.length > 0) {
-      const hands = result.landmarks;
+    if (lastResult && lastResult.landmarks && lastResult.landmarks.length > 0) {
+      const hands = lastResult.landmarks;
 
       // Beams render BEHIND the wireframes for cleaner look.
       if (hands.length === 2) {
@@ -235,12 +277,27 @@ function renderLoop() {
 }
 
 // ---------- Startup ----------
+// Progressive constraint fallback: start with the richest constraints, retry
+// with looser ones if the browser/device rejects them (e.g. desktop webcams
+// that don't advertise a facingMode, devices that can't hit 1280x720).
+const CAMERA_CONSTRAINT_ATTEMPTS = [
+  { audio: false, video: { facingMode: "user", width: { ideal: 1280 }, height: { ideal: 720 } } },
+  { audio: false, video: { facingMode: "user" } },
+  { audio: false, video: { width: { ideal: 1280 }, height: { ideal: 720 } } },
+  { audio: false, video: true },
+];
+
 // iOS Safari requires getUserMedia to be called synchronously inside the
 // user-gesture handler — any awaits before it cost the gesture context and
 // the call gets rejected silently. So the click handler stays NON-async,
 // fires off camera + model requests in parallel, and only then awaits.
 function handleStart() {
+  log("handleStart: user clicked START");
+  log("handleStart: mediaDevices present:", !!navigator.mediaDevices);
+  log("handleStart: getUserMedia present:", !!(navigator.mediaDevices && navigator.mediaDevices.getUserMedia));
+
   if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+    err("handleStart: getUserMedia missing");
     showError(
       "Browser unsupported",
       "navigator.mediaDevices.getUserMedia is missing — try the latest Safari/Chrome over HTTPS."
@@ -251,65 +308,98 @@ function handleStart() {
   startBtn.disabled = true;
   startBtn.textContent = "LOADING...";
 
+  // Kick off the first getUserMedia call SYNCHRONOUSLY in the gesture handler
+  // (iOS Safari requirement). The fallback chain runs only if this first one
+  // fails — and at that point the user-gesture token is already spent, so the
+  // browser must remember the permission decision for retries to work.
   let cameraPromise;
   try {
-    cameraPromise = navigator.mediaDevices.getUserMedia({
-      audio: false,
-      video: {
-        facingMode: "user",
-        width: { ideal: 1280 },
-        height: { ideal: 720 },
-      },
-    });
-  } catch (err) {
-    showError("Camera request threw", formatError(err));
+    log("handleStart: calling getUserMedia (primary constraints)");
+    cameraPromise = navigator.mediaDevices
+      .getUserMedia(CAMERA_CONSTRAINT_ATTEMPTS[0])
+      .catch(async (firstErr) => {
+        warn("primary getUserMedia failed:", firstErr.name, "-", firstErr.message);
+        if (firstErr.name === "NotAllowedError" || firstErr.name === "SecurityError") {
+          throw firstErr;
+        }
+        // Try remaining fallbacks (skip index 0 which we just tried).
+        let lastErr = firstErr;
+        for (let i = 1; i < CAMERA_CONSTRAINT_ATTEMPTS.length; i++) {
+          const constraints = CAMERA_CONSTRAINT_ATTEMPTS[i];
+          try {
+            log(`getUserMedia fallback ${i}:`, JSON.stringify(constraints));
+            return await navigator.mediaDevices.getUserMedia(constraints);
+          } catch (e) {
+            warn(`fallback ${i} failed:`, e.name, "-", e.message);
+            lastErr = e;
+            if (e.name === "NotAllowedError" || e.name === "SecurityError") throw e;
+          }
+        }
+        throw lastErr;
+      });
+    log("handleStart: getUserMedia promise created (not yet resolved)");
+  } catch (e) {
+    err("handleStart: getUserMedia threw synchronously:", e);
+    showError("Camera request threw", formatError(e));
     return;
   }
 
+  log("handleStart: starting model load in parallel");
   const modelPromise = loadModel();
 
   Promise.resolve()
     .then(async () => {
       let stream;
       try {
+        log("stage[camera]: awaiting getUserMedia");
         stream = await cameraPromise;
-      } catch (err) {
-        throw { stage: "camera", err };
+        log("stage[camera]: stream obtained");
+      } catch (e) {
+        err("stage[camera]: getUserMedia rejected:", e);
+        throw { stage: "camera", err: e };
       }
       try {
+        log("stage[video]: attaching stream");
         await attachCameraStream(stream);
-      } catch (err) {
-        throw { stage: "video", err };
+        log("stage[video]: stream attached OK");
+      } catch (e) {
+        err("stage[video]: attachCameraStream threw:", e);
+        throw { stage: "video", err: e };
       }
       try {
+        log("stage[model]: awaiting HandLandmarker");
         await modelPromise;
-      } catch (err) {
-        throw { stage: "model", err };
+        log("stage[model]: model ready");
+      } catch (e) {
+        err("stage[model]: model load failed:", e);
+        throw { stage: "model", err: e };
       }
+      log("startup complete — entering render loop");
       startScreen.hidden = true;
       running = true;
       requestAnimationFrame(renderLoop);
     })
     .catch((wrapped) => {
       const stage = wrapped && wrapped.stage ? wrapped.stage : "unknown";
-      const err = wrapped && wrapped.err ? wrapped.err : wrapped;
-      console.error(`[${stage}]`, err);
+      const e = wrapped && wrapped.err ? wrapped.err : wrapped;
+      err(`startup failed at stage [${stage}]:`, e);
       const titles = {
         camera: "Camera access denied",
         video: "Video stream failed",
         model: "Hand tracking model failed to load",
         unknown: "Startup failed",
       };
-      showError(titles[stage] || titles.unknown, formatError(err));
+      showError(titles[stage] || titles.unknown, formatError(e));
     });
 }
 
-function formatError(err) {
-  if (!err) return "(no error details)";
-  if (typeof err === "string") return err;
-  const name = err.name || err.constructor?.name || "Error";
-  const msg = err.message || String(err) || "(no message)";
-  return `${name}: ${msg}`;
+function formatError(e) {
+  if (!e) return "(no error details)";
+  if (typeof e === "string") return e;
+  const name = e.name || e.constructor?.name || "Error";
+  const msg = e.message || String(e) || "(no message)";
+  const stack = e.stack ? "\n\n" + e.stack : "";
+  return `${name}: ${msg}${stack}`;
 }
 
 function showError(title, detail) {
@@ -334,7 +424,31 @@ function showError(title, detail) {
   }
 }
 
-startBtn.addEventListener("click", handleStart);
+if (!startBtn) {
+  err("FATAL: start-btn element not found in DOM");
+} else {
+  startBtn.addEventListener("click", handleStart);
+  // Some touchscreen kiosks/wrappers fire only touchend, not click — belt-and-suspenders.
+  startBtn.addEventListener("touchend", (e) => {
+    e.preventDefault();
+    handleStart();
+  }, { passive: false });
+  log("start button listeners attached (click + touchend)");
+}
+
+// Probe device list early — doesn't require permission, just confirms a camera is present.
+if (navigator.mediaDevices && navigator.mediaDevices.enumerateDevices) {
+  navigator.mediaDevices.enumerateDevices()
+    .then((devices) => {
+      const cams = devices.filter((d) => d.kind === "videoinput");
+      log(`enumerateDevices: ${cams.length} video input(s) found`);
+      cams.forEach((c, i) => log(`  cam[${i}]: label="${c.label || "(hidden until permission granted)"}" id=${c.deviceId.slice(0, 8)}...`));
+      if (cams.length === 0) {
+        warn("No video input devices reported. Camera will fail to start.");
+      }
+    })
+    .catch((e) => warn("enumerateDevices failed:", e));
+}
 
 // Recompute canvas size if device orientation changes mid-session.
 window.addEventListener("resize", () => {
