@@ -1,48 +1,18 @@
-// ---------- Debug log panel ----------
-// Visible on screen so errors are readable without DevTools on mobile/deployed.
-const _logEl = (() => {
-  const el = document.createElement("pre");
-  el.id = "debug-log";
-  el.style.cssText = [
-    "position:fixed", "bottom:0", "left:0", "right:0",
-    "max-height:40vh", "overflow-y:auto",
-    "background:rgba(0,0,0,0.85)", "color:#0f0",
-    "font:11px/1.4 monospace", "padding:8px",
-    "white-space:pre-wrap", "word-break:break-all",
-    "z-index:9999", "border-top:1px solid #0f0",
-    "pointer-events:none",
-  ].join(";");
-  // Module scripts run after DOMContentLoaded, so listening for that event is
-  // a no-op. Append immediately if body exists, otherwise fall back to the event.
-  if (document.body) {
-    document.body.appendChild(el);
-  } else {
-    document.addEventListener("DOMContentLoaded", () => document.body.appendChild(el));
-  }
-  return el;
-})();
-
+// ---------- Logging ----------
+// Console-only. Kept as named helpers so call sites can use level-tagged
+// messages and switch back to an on-screen overlay quickly if needed.
 function dbg(level, ...args) {
   const ts = (performance.now() / 1000).toFixed(3);
   const prefix = `[${ts}] [${level}]`;
-  const text = args.map((a) => {
-    if (a instanceof Error) return `${a.name}: ${a.message}\n${a.stack || ""}`;
-    if (typeof a === "object") { try { return JSON.stringify(a); } catch { return String(a); } }
-    return String(a);
-  }).join(" ");
-  const line = `${prefix} ${text}`;
-  if (level === "ERR") console.error(line);
-  else if (level === "WARN") console.warn(line);
-  else console.log(line);
-  _logEl.textContent += line + "\n";
-  _logEl.scrollTop = _logEl.scrollHeight;
+  if (level === "ERR") console.error(prefix, ...args);
+  else if (level === "WARN") console.warn(prefix, ...args);
+  else console.log(prefix, ...args);
 }
 
 const log  = (...a) => dbg("LOG ", ...a);
 const warn = (...a) => dbg("WARN", ...a);
 const err  = (...a) => dbg("ERR ", ...a);
 
-// Catch unhandled rejections so they show in the panel too.
 window.addEventListener("unhandledrejection", (e) => {
   err("unhandledrejection:", e.reason);
 });
@@ -435,8 +405,6 @@ function showError(title, detail) {
   const titleEl = errorScreen.querySelector("h2");
   if (titleEl) titleEl.textContent = title || "Something went wrong";
   errorMsg.textContent = detail || "(no details)";
-  // Make debug log panel interactive so user can scroll/copy on error screens.
-  _logEl.style.pointerEvents = "auto";
   // Re-enable retry from the error screen.
   let retryBtn = document.getElementById("retry-btn");
   if (!retryBtn) {
