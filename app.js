@@ -1,7 +1,60 @@
+// ---------- Debug log panel ----------
+// Visible on screen so errors are readable without DevTools on mobile/deployed.
+const _logEl = (() => {
+  const el = document.createElement("pre");
+  el.id = "debug-log";
+  el.style.cssText = [
+    "position:fixed", "bottom:0", "left:0", "right:0",
+    "max-height:40vh", "overflow-y:auto",
+    "background:rgba(0,0,0,0.85)", "color:#0f0",
+    "font:11px/1.4 monospace", "padding:8px",
+    "white-space:pre-wrap", "word-break:break-all",
+    "z-index:9999", "border-top:1px solid #0f0",
+    "pointer-events:none",
+  ].join(";");
+  document.addEventListener("DOMContentLoaded", () => document.body.appendChild(el));
+  return el;
+})();
+
+function dbg(level, ...args) {
+  const ts = (performance.now() / 1000).toFixed(3);
+  const prefix = `[${ts}] [${level}]`;
+  const text = args.map((a) => {
+    if (a instanceof Error) return `${a.name}: ${a.message}\n${a.stack || ""}`;
+    if (typeof a === "object") { try { return JSON.stringify(a); } catch { return String(a); } }
+    return String(a);
+  }).join(" ");
+  const line = `${prefix} ${text}`;
+  if (level === "ERR") console.error(line);
+  else if (level === "WARN") console.warn(line);
+  else console.log(line);
+  _logEl.textContent += line + "\n";
+  _logEl.scrollTop = _logEl.scrollHeight;
+}
+
+const log  = (...a) => dbg("LOG ", ...a);
+const warn = (...a) => dbg("WARN", ...a);
+const err  = (...a) => dbg("ERR ", ...a);
+
+// Catch unhandled rejections so they show in the panel too.
+window.addEventListener("unhandledrejection", (e) => {
+  err("unhandledrejection:", e.reason);
+});
+window.addEventListener("error", (e) => {
+  err("globalerror:", e.message, "at", e.filename, e.lineno);
+});
+
+log("--- app module loading ---");
+log("UA:", navigator.userAgent);
+log("HTTPS:", location.protocol === "https:");
+log("href:", location.href);
+
 import {
   HandLandmarker,
   FilesetResolver,
 } from "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.35/vision_bundle.mjs";
+
+log("MediaPipe import OK");
 
 // ---------- Configuration ----------
 const MODEL_URL =
@@ -54,9 +107,9 @@ let fpsSamples = [];
 
 // ---------- Bootstrapping ----------
 async function loadModel() {
+  log("loadModel: resolving WASM fileset from", WASM_URL);
   const fileset = await FilesetResolver.forVisionTasks(WASM_URL);
-  // GPU delegate is faster but fragile on iOS Safari. Fall back to CPU on
-  // any failure so the app still works rather than dying silently.
+  log("loadModel: fileset resolved, creating HandLandmarker (GPU)");
   try {
     handLandmarker = await HandLandmarker.createFromOptions(fileset, {
       baseOptions: { modelAssetPath: MODEL_URL, delegate: "GPU" },
@@ -66,8 +119,9 @@ async function loadModel() {
       minHandPresenceConfidence: 0.5,
       minTrackingConfidence: 0.5,
     });
+    log("loadModel: HandLandmarker ready (GPU)");
   } catch (gpuErr) {
-    console.warn("GPU delegate failed, falling back to CPU:", gpuErr);
+    warn("loadModel: GPU delegate failed, falling back to CPU:", gpuErr);
     handLandmarker = await HandLandmarker.createFromOptions(fileset, {
       baseOptions: { modelAssetPath: MODEL_URL, delegate: "CPU" },
       runningMode: "VIDEO",
@@ -76,16 +130,25 @@ async function loadModel() {
       minHandPresenceConfidence: 0.5,
       minTrackingConfidence: 0.5,
     });
+    log("loadModel: HandLandmarker ready (CPU fallback)");
   }
 }
 
 async function attachCameraStream(stream) {
+  const tracks = stream.getVideoTracks();
+  log("attachCameraStream: tracks:", tracks.length, tracks.map((t) => `${t.label} [${t.readyState}]`).join(", "));
+  if (tracks.length) {
+    const s = tracks[0].getSettings();
+    log("attachCameraStream: track settings:", `${s.width}x${s.height} facing=${s.facingMode}`);
+  }
   video.srcObject = stream;
   await new Promise((res) => {
-    if (video.readyState >= 2) return res();
-    video.onloadedmetadata = () => res();
+    if (video.readyState >= 2) { log("attachCameraStream: metadata already ready"); return res(); }
+    video.onloadedmetadata = () => { log("attachCameraStream: onloadedmetadata fired"); res(); };
   });
+  log("attachCameraStream: calling video.play()");
   await video.play();
+  log("attachCameraStream: play() resolved, video size:", video.videoWidth, "x", video.videoHeight);
   resizeCanvas();
 }
 
@@ -240,7 +303,12 @@ function renderLoop() {
 // the call gets rejected silently. So the click handler stays NON-async,
 // fires off camera + model requests in parallel, and only then awaits.
 function handleStart() {
+  log("handleStart: user clicked START");
+  log("handleStart: mediaDevices present:", !!navigator.mediaDevices);
+  log("handleStart: getUserMedia present:", !!(navigator.mediaDevices && navigator.mediaDevices.getUserMedia));
+
   if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+    err("handleStart: getUserMedia missing");
     showError(
       "Browser unsupported",
       "navigator.mediaDevices.getUserMedia is missing — try the latest Safari/Chrome over HTTPS."
@@ -253,6 +321,7 @@ function handleStart() {
 
   let cameraPromise;
   try {
+    log("handleStart: calling getUserMedia");
     cameraPromise = navigator.mediaDevices.getUserMedia({
       audio: false,
       video: {
@@ -261,55 +330,69 @@ function handleStart() {
         height: { ideal: 720 },
       },
     });
-  } catch (err) {
-    showError("Camera request threw", formatError(err));
+    log("handleStart: getUserMedia promise created (not yet resolved)");
+  } catch (e) {
+    err("handleStart: getUserMedia threw synchronously:", e);
+    showError("Camera request threw", formatError(e));
     return;
   }
 
+  log("handleStart: starting model load in parallel");
   const modelPromise = loadModel();
 
   Promise.resolve()
     .then(async () => {
       let stream;
       try {
+        log("stage[camera]: awaiting getUserMedia");
         stream = await cameraPromise;
-      } catch (err) {
-        throw { stage: "camera", err };
+        log("stage[camera]: stream obtained");
+      } catch (e) {
+        err("stage[camera]: getUserMedia rejected:", e);
+        throw { stage: "camera", err: e };
       }
       try {
+        log("stage[video]: attaching stream");
         await attachCameraStream(stream);
-      } catch (err) {
-        throw { stage: "video", err };
+        log("stage[video]: stream attached OK");
+      } catch (e) {
+        err("stage[video]: attachCameraStream threw:", e);
+        throw { stage: "video", err: e };
       }
       try {
+        log("stage[model]: awaiting HandLandmarker");
         await modelPromise;
-      } catch (err) {
-        throw { stage: "model", err };
+        log("stage[model]: model ready");
+      } catch (e) {
+        err("stage[model]: model load failed:", e);
+        throw { stage: "model", err: e };
       }
+      log("startup complete — entering render loop");
       startScreen.hidden = true;
       running = true;
       requestAnimationFrame(renderLoop);
     })
     .catch((wrapped) => {
       const stage = wrapped && wrapped.stage ? wrapped.stage : "unknown";
-      const err = wrapped && wrapped.err ? wrapped.err : wrapped;
-      console.error(`[${stage}]`, err);
+      const e = wrapped && wrapped.err ? wrapped.err : wrapped;
+      err(`startup failed at stage [${stage}]:`, e);
       const titles = {
         camera: "Camera access denied",
         video: "Video stream failed",
         model: "Hand tracking model failed to load",
         unknown: "Startup failed",
       };
-      showError(titles[stage] || titles.unknown, formatError(err));
+      showError(titles[stage] || titles.unknown, formatError(e));
     });
 }
 
-function formatError(err) {
-  if (!err) return "(no error details)";
-  if (typeof err === "string") return err;
-  const name = err.name || err.constructor?.name || "Error";
-  const msg = err.message || String(err) || "(no message)";
-  return `${name}: ${msg}`;
+function formatError(e) {
+  if (!e) return "(no error details)";
+  if (typeof e === "string") return e;
+  const name = e.name || e.constructor?.name || "Error";
+  const msg = e.message || String(e) || "(no message)";
+  const stack = e.stack ? "\n\n" + e.stack : "";
+  return `${name}: ${msg}${stack}`;
 }
 
 function showError(title, detail) {
@@ -318,6 +401,8 @@ function showError(title, detail) {
   const titleEl = errorScreen.querySelector("h2");
   if (titleEl) titleEl.textContent = title || "Something went wrong";
   errorMsg.textContent = detail || "(no details)";
+  // Make debug log panel interactive so user can scroll/copy on error screens.
+  _logEl.style.pointerEvents = "auto";
   // Re-enable retry from the error screen.
   let retryBtn = document.getElementById("retry-btn");
   if (!retryBtn) {
