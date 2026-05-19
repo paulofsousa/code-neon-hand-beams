@@ -80,6 +80,10 @@ let handLandmarker = null;
 let running = false;
 let lastVideoTime = -1;
 let fpsSamples = [];
+// Last detection result, reused on rAF ticks that don't have a fresh video frame.
+// Without this, the canvas clears every frame but only redraws hands on ticks
+// where the video actually advanced, causing 30Hz flicker against the 60Hz rAF.
+let lastResult = null;
 
 // ---------- Bootstrapping ----------
 async function loadModel() {
@@ -91,9 +95,9 @@ async function loadModel() {
       baseOptions: { modelAssetPath: MODEL_URL, delegate: "GPU" },
       runningMode: "VIDEO",
       numHands: 2,
-      minHandDetectionConfidence: 0.5,
+      minHandDetectionConfidence: 0.6,
       minHandPresenceConfidence: 0.5,
-      minTrackingConfidence: 0.5,
+      minTrackingConfidence: 0.3,
     });
     log("loadModel: HandLandmarker ready (GPU)");
   } catch (gpuErr) {
@@ -102,9 +106,9 @@ async function loadModel() {
       baseOptions: { modelAssetPath: MODEL_URL, delegate: "CPU" },
       runningMode: "VIDEO",
       numHands: 2,
-      minHandDetectionConfidence: 0.5,
+      minHandDetectionConfidence: 0.6,
       minHandPresenceConfidence: 0.5,
-      minTrackingConfidence: 0.5,
+      minTrackingConfidence: 0.3,
     });
     log("loadModel: HandLandmarker ready (CPU fallback)");
   }
@@ -231,14 +235,13 @@ function renderLoop() {
     ctx.clearRect(0, 0, w, h);
 
     const now = performance.now();
-    let result = null;
     if (video.currentTime !== lastVideoTime) {
       lastVideoTime = video.currentTime;
-      result = handLandmarker.detectForVideo(video, now);
+      lastResult = handLandmarker.detectForVideo(video, now);
     }
 
-    if (result && result.landmarks && result.landmarks.length > 0) {
-      const hands = result.landmarks;
+    if (lastResult && lastResult.landmarks && lastResult.landmarks.length > 0) {
+      const hands = lastResult.landmarks;
 
       // Beams render BEHIND the wireframes for cleaner look.
       if (hands.length === 2) {
