@@ -145,5 +145,30 @@ html, body {
   box-shadow: 0 0 24px rgba(0, 255, 231, 0.8);
 }
 
-#error-screen h2 { color: #ff2bd6; }
-#error-screen p { color: rgba(255, 255, 255, 0.7); max-width: 320px; }
+#error-screen h2 {
+  color: #ff2bd6;
+  text-shadow: 0 0 10px rgba(255, 43, 214, 0.7);
+}
+#error-screen p {
+  color: rgba(255, 255, 255, 0.8);
+  max-width: 320px;
+  font-size: 13px;
+  word-break: break-word;
+}
+
+#retry-btn {
+  margin-top: 16px;
+  padding: 12px 32px;
+  font-family: inherit;
+  font-size: 16px;
+  letter-spacing: 3px;
+  background: transparent;
+  color: #ff2bd6;
+  border: 2px solid #ff2bd6;
+  border-radius: 4px;
+  cursor: pointer;
+  box-shadow: 0 0 14px rgba(255, 43, 214, 0.5);
+}
+#retry-btn:active {
+  background: rgba(255, 43, 214, 0.15);
+}

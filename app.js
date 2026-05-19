@@ -55,26 +55,31 @@ let fpsSamples = [];
 // ---------- Bootstrapping ----------
 async function loadModel() {
   const fileset = await FilesetResolver.forVisionTasks(WASM_URL);
-  handLandmarker = await HandLandmarker.createFromOptions(fileset, {
-    baseOptions: { modelAssetPath: MODEL_URL, delegate: "GPU" },
-    runningMode: "VIDEO",
-    numHands: 2,
-    minHandDetectionConfidence: 0.5,
-    minHandPresenceConfidence: 0.5,
-    minTrackingConfidence: 0.5,
-  });
+  // GPU delegate is faster but fragile on iOS Safari. Fall back to CPU on
+  // any failure so the app still works rather than dying silently.
+  try {
+    handLandmarker = await HandLandmarker.createFromOptions(fileset, {
+      baseOptions: { modelAssetPath: MODEL_URL, delegate: "GPU" },
+      runningMode: "VIDEO",
+      numHands: 2,
+      minHandDetectionConfidence: 0.5,
+      minHandPresenceConfidence: 0.5,
+      minTrackingConfidence: 0.5,
+    });
+  } catch (gpuErr) {
+    console.warn("GPU delegate failed, falling back to CPU:", gpuErr);
+    handLandmarker = await HandLandmarker.createFromOptions(fileset, {
+      baseOptions: { modelAssetPath: MODEL_URL, delegate: "CPU" },
+      runningMode: "VIDEO",
+      numHands: 2,
+      minHandDetectionConfidence: 0.5,
+      minHandPresenceConfidence: 0.5,
+      minTrackingConfidence: 0.5,
+    });
+  }
 }
 
-async function startCamera() {
-  const constraints = {
-    audio: false,
-    video: {
-      facingMode: "user",
-      width: { ideal: 1280 },
-      height: { ideal: 720 },
-    },
-  };
-  const stream = await navigator.mediaDevices.getUserMedia(constraints);
+async function attachCameraStream(stream) {
   video.srcObject = stream;
   await new Promise((res) => {
     if (video.readyState >= 2) return res();
@@ -230,28 +235,106 @@ function renderLoop() {
 }
 
 // ---------- Startup ----------
-async function start() {
+// iOS Safari requires getUserMedia to be called synchronously inside the
+// user-gesture handler — any awaits before it cost the gesture context and
+// the call gets rejected silently. So the click handler stays NON-async,
+// fires off camera + model requests in parallel, and only then awaits.
+function handleStart() {
+  if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+    showError(
+      "Browser unsupported",
+      "navigator.mediaDevices.getUserMedia is missing — try the latest Safari/Chrome over HTTPS."
+    );
+    return;
+  }
+
   startBtn.disabled = true;
   startBtn.textContent = "LOADING...";
+
+  let cameraPromise;
   try {
-    await loadModel();
-    await startCamera();
-    startScreen.hidden = true;
-    running = true;
-    requestAnimationFrame(renderLoop);
+    cameraPromise = navigator.mediaDevices.getUserMedia({
+      audio: false,
+      video: {
+        facingMode: "user",
+        width: { ideal: 1280 },
+        height: { ideal: 720 },
+      },
+    });
   } catch (err) {
-    console.error(err);
-    showError(err);
+    showError("Camera request threw", formatError(err));
+    return;
+  }
+
+  const modelPromise = loadModel();
+
+  Promise.resolve()
+    .then(async () => {
+      let stream;
+      try {
+        stream = await cameraPromise;
+      } catch (err) {
+        throw { stage: "camera", err };
+      }
+      try {
+        await attachCameraStream(stream);
+      } catch (err) {
+        throw { stage: "video", err };
+      }
+      try {
+        await modelPromise;
+      } catch (err) {
+        throw { stage: "model", err };
+      }
+      startScreen.hidden = true;
+      running = true;
+      requestAnimationFrame(renderLoop);
+    })
+    .catch((wrapped) => {
+      const stage = wrapped && wrapped.stage ? wrapped.stage : "unknown";
+      const err = wrapped && wrapped.err ? wrapped.err : wrapped;
+      console.error(`[${stage}]`, err);
+      const titles = {
+        camera: "Camera access denied",
+        video: "Video stream failed",
+        model: "Hand tracking model failed to load",
+        unknown: "Startup failed",
+      };
+      showError(titles[stage] || titles.unknown, formatError(err));
+    });
+}
+
+function formatError(err) {
+  if (!err) return "(no error details)";
+  if (typeof err === "string") return err;
+  const name = err.name || err.constructor?.name || "Error";
+  const msg = err.message || String(err) || "(no message)";
+  return `${name}: ${msg}`;
+}
+
+function showError(title, detail) {
+  startScreen.hidden = true;
+  errorScreen.hidden = false;
+  const titleEl = errorScreen.querySelector("h2");
+  if (titleEl) titleEl.textContent = title || "Something went wrong";
+  errorMsg.textContent = detail || "(no details)";
+  // Re-enable retry from the error screen.
+  let retryBtn = document.getElementById("retry-btn");
+  if (!retryBtn) {
+    retryBtn = document.createElement("button");
+    retryBtn.id = "retry-btn";
+    retryBtn.textContent = "RETRY";
+    retryBtn.addEventListener("click", () => {
+      errorScreen.hidden = true;
+      startScreen.hidden = false;
+      startBtn.disabled = false;
+      startBtn.textContent = "START";
+    });
+    errorScreen.appendChild(retryBtn);
   }
 }
 
-function showError(err) {
-  startScreen.hidden = true;
-  errorScreen.hidden = false;
-  errorMsg.textContent = (err && err.message) || String(err);
-}
-
-startBtn.addEventListener("click", start);
+startBtn.addEventListener("click", handleStart);
 
 // Recompute canvas size if device orientation changes mid-session.
 window.addEventListener("resize", () => {
