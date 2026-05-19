@@ -3,7 +3,7 @@ name: Deploy to GitHub Pages
 on:
   push:
     branches:
-      - claude/hand-tracking-webcam-UzQ4C
+      - main
   workflow_dispatch:
 
 permissions:
