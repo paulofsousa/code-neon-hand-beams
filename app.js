@@ -12,7 +12,13 @@ const _logEl = (() => {
     "z-index:9999", "border-top:1px solid #0f0",
     "pointer-events:none",
   ].join(";");
-  document.addEventListener("DOMContentLoaded", () => document.body.appendChild(el));
+  // Module scripts run after DOMContentLoaded, so listening for that event is
+  // a no-op. Append immediately if body exists, otherwise fall back to the event.
+  if (document.body) {
+    document.body.appendChild(el);
+  } else {
+    document.addEventListener("DOMContentLoaded", () => document.body.appendChild(el));
+  }
   return el;
 })();
 
@@ -298,6 +304,16 @@ function renderLoop() {
 }
 
 // ---------- Startup ----------
+// Progressive constraint fallback: start with the richest constraints, retry
+// with looser ones if the browser/device rejects them (e.g. desktop webcams
+// that don't advertise a facingMode, devices that can't hit 1280x720).
+const CAMERA_CONSTRAINT_ATTEMPTS = [
+  { audio: false, video: { facingMode: "user", width: { ideal: 1280 }, height: { ideal: 720 } } },
+  { audio: false, video: { facingMode: "user" } },
+  { audio: false, video: { width: { ideal: 1280 }, height: { ideal: 720 } } },
+  { audio: false, video: true },
+];
+
 // iOS Safari requires getUserMedia to be called synchronously inside the
 // user-gesture handler — any awaits before it cost the gesture context and
 // the call gets rejected silently. So the click handler stays NON-async,
@@ -319,17 +335,35 @@ function handleStart() {
   startBtn.disabled = true;
   startBtn.textContent = "LOADING...";
 
+  // Kick off the first getUserMedia call SYNCHRONOUSLY in the gesture handler
+  // (iOS Safari requirement). The fallback chain runs only if this first one
+  // fails — and at that point the user-gesture token is already spent, so the
+  // browser must remember the permission decision for retries to work.
   let cameraPromise;
   try {
-    log("handleStart: calling getUserMedia");
-    cameraPromise = navigator.mediaDevices.getUserMedia({
-      audio: false,
-      video: {
-        facingMode: "user",
-        width: { ideal: 1280 },
-        height: { ideal: 720 },
-      },
-    });
+    log("handleStart: calling getUserMedia (primary constraints)");
+    cameraPromise = navigator.mediaDevices
+      .getUserMedia(CAMERA_CONSTRAINT_ATTEMPTS[0])
+      .catch(async (firstErr) => {
+        warn("primary getUserMedia failed:", firstErr.name, "-", firstErr.message);
+        if (firstErr.name === "NotAllowedError" || firstErr.name === "SecurityError") {
+          throw firstErr;
+        }
+        // Try remaining fallbacks (skip index 0 which we just tried).
+        let lastErr = firstErr;
+        for (let i = 1; i < CAMERA_CONSTRAINT_ATTEMPTS.length; i++) {
+          const constraints = CAMERA_CONSTRAINT_ATTEMPTS[i];
+          try {
+            log(`getUserMedia fallback ${i}:`, JSON.stringify(constraints));
+            return await navigator.mediaDevices.getUserMedia(constraints);
+          } catch (e) {
+            warn(`fallback ${i} failed:`, e.name, "-", e.message);
+            lastErr = e;
+            if (e.name === "NotAllowedError" || e.name === "SecurityError") throw e;
+          }
+        }
+        throw lastErr;
+      });
     log("handleStart: getUserMedia promise created (not yet resolved)");
   } catch (e) {
     err("handleStart: getUserMedia threw synchronously:", e);
@@ -419,7 +453,31 @@ function showError(title, detail) {
   }
 }
 
-startBtn.addEventListener("click", handleStart);
+if (!startBtn) {
+  err("FATAL: start-btn element not found in DOM");
+} else {
+  startBtn.addEventListener("click", handleStart);
+  // Some touchscreen kiosks/wrappers fire only touchend, not click — belt-and-suspenders.
+  startBtn.addEventListener("touchend", (e) => {
+    e.preventDefault();
+    handleStart();
+  }, { passive: false });
+  log("start button listeners attached (click + touchend)");
+}
+
+// Probe device list early — doesn't require permission, just confirms a camera is present.
+if (navigator.mediaDevices && navigator.mediaDevices.enumerateDevices) {
+  navigator.mediaDevices.enumerateDevices()
+    .then((devices) => {
+      const cams = devices.filter((d) => d.kind === "videoinput");
+      log(`enumerateDevices: ${cams.length} video input(s) found`);
+      cams.forEach((c, i) => log(`  cam[${i}]: label="${c.label || "(hidden until permission granted)"}" id=${c.deviceId.slice(0, 8)}...`));
+      if (cams.length === 0) {
+        warn("No video input devices reported. Camera will fail to start.");
+      }
+    })
+    .catch((e) => warn("enumerateDevices failed:", e));
+}
 
 // Recompute canvas size if device orientation changes mid-session.
 window.addEventListener("resize", () => {
